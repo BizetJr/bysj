@@ -1,0 +1,489 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <fcntl.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <libaudit.h>
+#include <sys/ioctl.h>
+#include <linux/audit.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+#include <pthread.h>
+#include <pwd.h>
+#include <pcap.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+
+#define NETWORK_CARD "ens33"
+#define MAX_PACKET_SIZE 65535
+#define INFO_NUM     10
+
+char result[INFO_NUM][1024] = {0};
+char src_ip[INFO_NUM][INET_ADDRSTRLEN] = {0};      // 来访IP
+char dst_ip[INFO_NUM][INET_ADDRSTRLEN] = {0};      // 访问IP
+/*********************函数原型*********************/
+int count_users();
+long get_memory_usage();
+char* get_username(int uid);
+void showInfo(SDL_Renderer* renderer, TTF_Font* font);
+void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet);
+int get_net_speed(const char *interface, unsigned long long *rx_bytes, unsigned long long *tx_bytes);
+/*********************函数原型*********************/
+int parseUid(char *buffer)//用户标识符
+{
+       char result[32] = {0};
+       const char *start, *end;
+       start = strstr(buffer, " uid=");//uid开始位置
+       int len = strlen(" uid=");
+       end = strstr(start + len + 1, " ");//uid结束位置
+       if( start == NULL || end == NULL)
+              return 0;
+       int length = end - start - len;//uid长度
+       strncpy(result, start + len, length);//uid内容复制到result
+       return atoi(result);
+}
+time_t parseTimestamp(char *buffer)//时间戳
+{
+       char result[32] = {0};
+       const char *start, *end;
+       //msg=audit是一个标记，记录系统日志中的安全审计事件
+       start = strstr(buffer, "msg=audit(");
+       int len = strlen("msg=audit(");
+       end = strstr(start, ".");
+       if( start == NULL || end == NULL)
+              return 0;
+       int length = end - start - len;
+       strncpy(result, start + len, length);
+       return strtoimax(result, NULL, 10);
+}
+char* parseComm(char *buffer)//进程名称
+{
+       char *result = (char*)malloc(256);
+       memset(result, 0, 256);//清零result指向的内存块
+       const char *start, *end;
+       start = strstr(buffer, "comm=");
+       int len = strlen("comm=");
+       end = strstr(start + len + 1, "\"");
+       if( start == NULL || end == NULL)
+              return 0;
+       int length = end - start - len - 1;
+       strncpy(result, start + len + 1, length);
+       return result;
+}
+char* parseExe(char *buffer)//可执行文件路径
+{
+       char *result = (char*)malloc(256);
+       memset(result, 0, 256);
+       const char *start, *end;
+       start = strstr(buffer, "exe=");
+       int len = strlen("exe=");
+       end = strstr(start + len + 1, "\"");
+       if( start == NULL || end == NULL)
+              return 0;
+       int length = end - start - len - 1;
+       strncpy(result, start + len + 1, length);
+       return result;
+}
+// 线程函数 监控文件
+void *thread_watch_file(void *arg)
+{
+       printf("%s\n", __FUNCTION__);
+       system("auditctl -D");// 清空所有规则
+       sleep(1);
+       system("auditctl -w /etc/shadow -p rwxa -k ok_change");// 添加指定文件的监控规则
+       time_t timestamp;
+       while (1)
+       {
+              FILE *fp;
+              char buffer[1024];
+              // 执行命令并读取输出
+              fp = popen("ausearch -k ok_change", "r");//搜索与权限相关的审计事件
+              if (fp == NULL) {
+                     printf("Error: Failed to execute command.\n");
+                     continue;
+              }
+              // 读取命令输出
+              while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+                     char *substr = strstr(buffer, "ok_change");
+                     if(substr != NULL) 
+                     {
+                            substr = strstr(buffer, "type=SYSCALL");//定位和提取与系统调用相关的日志条目
+                            if(substr != NULL)
+                            {
+                                   time_t curTimestamp = parseTimestamp(buffer);
+                                   if(curTimestamp > timestamp)
+                                   {
+                                          for(int i = 0; i < INFO_NUM - 1; i++)
+                                          {
+                                                 sprintf(result[i], "%s", result[i + 1]);
+                                          }
+                                          int uid = parseUid(buffer);
+                                          // 将时间戳转换为字符串
+                                          char timeStr[64] = { 0 };
+                                          strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localtime(&curTimestamp));
+                                          char *comm = parseComm(buffer);
+                                          char *exe = parseExe(buffer);
+                                          char *uidStr = get_username(uid);//用户标识符转化为用户名
+                                          sprintf(result[INFO_NUM - 1], "time:%s, uid:%s, comm:%s, exe:%s", timeStr, uidStr, comm, exe);
+                                          free(comm);
+                                          free(exe);
+                                          // 更新时间戳
+                                          timestamp = curTimestamp;
+                                   }
+                                   
+                            }
+                     }
+              }
+              pclose(fp);
+              sleep(1);
+       }
+}
+//网络IP
+void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet)
+{
+       for(int i = 0; i < INFO_NUM - 1; i++)
+       {
+              sprintf(src_ip[i], "%s", src_ip[i + 1]);
+              sprintf(dst_ip[i], "%s", dst_ip[i + 1]);
+              //往前挪一位，为最新的IP腾位置，保留最新丢弃最旧
+       }
+       struct ip *iph;
+       // 提取IP报文
+       // 偏移以跳过以太网帧头部
+       iph = (struct ip *)(packet + 14); 
+       // 将二进制形式的IP地址转换为可读的字符串形式存储到最后一个元素的位置
+       memset(src_ip, 0, INET_ADDRSTRLEN);
+       memset(dst_ip, 0, INET_ADDRSTRLEN);//清空
+       inet_ntop(AF_INET, &(iph->ip_src), src_ip[INFO_NUM - 1], INET_ADDRSTRLEN);
+       inet_ntop(AF_INET, &(iph->ip_dst), dst_ip[INFO_NUM - 1], INET_ADDRSTRLEN);
+}
+void *thread_watch_network(void *arg)
+{
+       pcap_t *handle;
+       char errbuf[PCAP_ERRBUF_SIZE];
+       struct bpf_program fp;
+
+       // 打开网络接口进行抓包（这里使用默认网卡，可以根据需要修改）
+       handle = pcap_open_live(NETWORK_CARD, MAX_PACKET_SIZE, 1, 1000, errbuf);
+       if (handle == NULL) {
+              fprintf(stderr, "Couldn't open device: %s\n", errbuf);
+              exit(EXIT_FAILURE);
+       }
+
+       // 设置过滤器，只捕获IP数据包
+       if (pcap_compile(handle, &fp, "ip", 0, PCAP_NETMASK_UNKNOWN) == -1) {
+              fprintf(stderr, "Couldn't parse filter: %s\n", pcap_geterr(handle));
+              exit(EXIT_FAILURE);
+       }
+       //将过滤器程序应用到网络接口上
+       if (pcap_setfilter(handle, &fp) == -1) {
+              fprintf(stderr, "Couldn't install filter: %s\n", pcap_geterr(handle));
+              exit(EXIT_FAILURE);
+       }
+
+       // 开始抓包
+       pcap_loop(handle, -1, packet_handler, NULL);
+
+       // 关闭网络接口
+       pcap_close(handle);
+}
+int runWindows();
+int main(int argc, char *argv[])
+{
+       // 启动线程
+       pthread_t tid;
+       int threadId;
+       int result = pthread_create(&tid, NULL, thread_watch_file, &threadId);
+       result = pthread_create(&tid, NULL, thread_watch_network, &threadId);
+       // 显示窗口
+       runWindows();
+       //close(fd);
+       return 0;
+}
+int runWindows() 
+{
+       // 初始化SDL
+       if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+              printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
+              return 1;
+       }
+       // 创建窗口
+       SDL_Window* window = SDL_CreateWindow("OpenEuler内核监测", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1650, 870, SDL_WINDOW_MAXIMIZED);
+       if (window == NULL) {
+              printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
+              return 1;
+       }
+       // 创建渲染器
+       SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+       if (renderer == NULL) {
+              printf("Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
+              return 1;
+       }
+       // 初始化TTF
+       if (TTF_Init() == -1) {
+              printf("TTF could not initialize! TTF_Error: %s\n", TTF_GetError());
+              return 1;
+       }
+
+       // 加载字体
+       TTF_Font* font = TTF_OpenFont("/usr/share/fonts/stix/STIX-Bold.otf", 30); // 修改字体文件路径和大小
+       if (font == NULL) {
+              printf("Failed to load font! TTF_Error: %s\n", TTF_GetError());
+              return 1;
+       }
+       // 事件循环
+       SDL_Event event;
+       int quit = 0;
+       while (!quit) {
+              // 处理事件
+              while (SDL_PollEvent(&event) != 0) {
+                     // 如果是关闭窗口事件，退出循环
+                     if (event.type == SDL_QUIT) {
+                            quit = 1;
+                     }
+              }
+              /*在这里可以添加其他游戏逻辑或渲染代码*/
+              // 清空窗口
+              SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // 设置清空窗口的颜色为黑色
+              SDL_RenderClear(renderer);
+              // 显示信息
+              showInfo(renderer, font);
+              // 更新窗口显示
+              SDL_RenderPresent(renderer);
+              // 延迟一段时间，避免CPU占用过高
+              SDL_Delay(1000);
+       }
+       // 释放资源并退出SDL
+       TTF_CloseFont(font);
+       TTF_Quit();
+       SDL_DestroyRenderer(renderer);
+       SDL_DestroyWindow(window);
+       SDL_Quit();
+}
+#define LINE_H       40
+void showInfo(SDL_Renderer* renderer, TTF_Font* font)
+{
+       // 渲染文字到表面
+       SDL_Color textColor = {255, 255, 255}; // 白色文字
+       int yTop = 0;
+       for(int i = 0; i < 50; i++)
+       {
+              char info[1024] = {0};
+              if(i == 0)
+              {
+                     char *username = getlogin();
+                     if(username != NULL)
+                     {
+                            sprintf(info, "Current User: %s, There are %d users", username, count_users());
+                     }
+                     else 
+                            continue;
+              }
+              else if(i == 1)    // 时间
+              {
+                     char week[][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+                     // 获取当前时间
+                     time_t currentTime;
+                     struct tm *localTime;
+                     currentTime = time(NULL);
+                     localTime = localtime(&currentTime);
+                     sprintf(info, "DataTime: %04d-%02d-%02d %02d:%02d:%02d %s", 
+                            localTime->tm_year + 1900, localTime->tm_mon + 1, localTime->tm_mday, 
+                            localTime->tm_hour, localTime->tm_min, localTime->tm_sec, week[localTime->tm_wday]);
+                     yTop += LINE_H;
+              }
+              else if(i == 2)// 内存剩余
+              {
+                     long memory_usage = get_memory_usage();
+                     if (memory_usage != -1) 
+                     {
+                            sprintf(info, "Current avail memory: %.02f Mb", memory_usage / 1024.0);
+                            yTop += LINE_H;
+                     } else { continue; }
+              }
+              else if(i == 3)// 网速
+              {
+                     const char *interface = NETWORK_CARD; // 指定网络接口
+                     static unsigned long long prev_rx_bytes = 0, prev_tx_bytes = 0;//上一次字节数清零
+                     static unsigned long long curr_rx_bytes = 0, curr_tx_bytes = 0;//当前字节数清零
+                     float interval = 0.5;    //更新时间 秒
+                     if (get_net_speed(interface, &curr_rx_bytes, &curr_tx_bytes) == 0)
+                     {
+                            // 计算速度
+                            unsigned long long rx_speed = (curr_rx_bytes - prev_rx_bytes) / interval;
+                            unsigned long long tx_speed = (curr_tx_bytes - prev_tx_bytes) / interval;
+                            // 速度以千字节每秒 (Kb/s) 为单位，除以 1024 来将字节数转换为千字节
+                            sprintf(info, "Rx speed: %.02f Kb/s, Tx speed: %.02f Kb/s", rx_speed / 1024.0, tx_speed / 1024.0);
+                            // 更新前一个数据量
+                            prev_rx_bytes = curr_rx_bytes;
+                            prev_tx_bytes = curr_tx_bytes;
+
+                            yTop += LINE_H;
+                     }
+              }
+              else if(i == 4)// 显示进程
+              {
+                     FILE *fp;
+                     char output[1024];
+                     // 执行命令并打开文件流
+                     fp = popen("ps aux | wc -l | awk '{print $1 - 1}'", "r");
+                     if (fp == NULL) {
+                            perror("popen");
+                            continue;
+                     }
+                     // 读取命令输出并打印到标准输出
+                     while (fgets(output, sizeof(output), fp) != NULL) {
+                            
+                     }
+                     // 关闭文件流
+                     if (pclose(fp) == -1) {
+                            perror("pclose");
+                            continue;
+                     }
+                     sprintf(info, "Number of processes: %s", output);
+                     yTop += LINE_H;
+              }
+              else if(i == 5)
+              {
+                     yTop += 8;
+                     continue;
+              }
+              else if(i >= 6 && i < 16)      // 监控网络IP访问
+              {
+                     if(strlen(src_ip[i - 5]) == 0)
+                            continue;
+                     sprintf(info, "Visiting IP:%s, Target IP:%s", src_ip[i - 5], dst_ip[i - 5]);
+                     yTop += LINE_H - 8;
+              }
+              else if(i == 16)
+              {
+                     yTop += 8;
+                     continue;
+              }
+              else if(i >= 17 && i < 27)      // 监控文件
+              {
+                     if(strlen(result[i - 16]) == 0)
+                            continue;
+                     if(strstr(result[i - 16], "uid:root") == 0)
+                     {
+                            SDL_Color tmp = {255, 0, 0};
+                            textColor = tmp;
+                     }
+                     else
+                     {
+                            SDL_Color tmp = {255, 255, 255};
+                            textColor = tmp;
+                     }
+                     sprintf(info, "File Status: %s", result[i - 16]);
+                     yTop += LINE_H - 8;
+              }
+              else { continue; }
+              SDL_Surface* textSurface = TTF_RenderText_Solid(font, info, textColor);
+              if (textSurface == NULL) 
+              {
+                     printf("Failed to render text surface! TTF_Error: %s\n", TTF_GetError());
+                     continue;;
+              }
+              // 创建纹理
+              SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
+              if (textTexture == NULL) 
+              {
+                     printf("Failed to create texture from surface! SDL_Error: %s\n", SDL_GetError());
+              }
+              else
+              {
+                     // 获取纹理宽度和高度
+                     int textWidth = textSurface->w;
+                     int textHeight = textSurface->h;
+                     // 定义文字位置和大小
+                     SDL_Rect dstRect = {15, 15 + yTop, textWidth, textHeight};
+                     // 绘制文字
+                     SDL_RenderCopy(renderer, textTexture, NULL, &dstRect);
+
+                     SDL_FreeSurface(textSurface);
+                     SDL_DestroyTexture(textTexture);
+              }
+       }
+}
+// 计算用户数量
+#define PASSWD_FILE "/etc/passwd"
+int count_users()
+{
+    FILE *passwd_file = fopen(PASSWD_FILE, "r");
+    if (passwd_file == NULL) {
+        perror("Failed to open /etc/passwd");
+        return -1;
+    }
+
+    char line[1024];
+    int num_users = 0;
+    // 逐行读取文件
+    while (fgets(line, sizeof(line), passwd_file)) {
+        // 每行都包含一个用户的信息，以冒号分隔字段
+        // 我们只需要统计行数即可
+        num_users++;
+    }
+    fclose(passwd_file);
+    return num_users;
+}
+// 根据UID查找用户名
+char* get_username(int uid) {
+    // 调用 getpwuid() 函数获取用户信息
+    struct passwd *pwd = getpwuid(uid);
+    return pwd->pw_name;
+}
+// 获取当前内存使用
+#define MEMINFO_PATH "/proc/meminfo"
+long get_memory_usage() {
+    FILE *meminfo_file = fopen(MEMINFO_PATH, "r");
+    if (meminfo_file == NULL) {
+        perror("Failed to open /proc/meminfo");
+        return -1;
+    }
+
+    char line[256];
+    long memory_usage = -1;
+    // 逐行读取文件
+    while (fgets(line, sizeof(line), meminfo_file)) {
+        // 在 /proc/meminfo 文件中搜索 "MemAvailable" 字段
+        if (strncmp(line, "MemAvailable:", 13) == 0) {
+            // 读取内存使用量（以 KB 为单位）
+            sscanf(line + 13, "%ld", &memory_usage);
+            break;
+        }
+    }
+    fclose(meminfo_file);
+    return memory_usage;
+}
+// 获取网络速度
+#define NET_DEV_FILE "/proc/net/dev"
+int get_net_speed(const char *interface, unsigned long long *rx_bytes, unsigned long long *tx_bytes) 
+{
+       FILE *net_dev_file = fopen(NET_DEV_FILE, "r");
+       if (net_dev_file == NULL) {
+              perror("Failed to open /proc/net/dev");
+              return -1;
+       }
+
+       char line[1024];
+       int found = 0;
+       // 逐行读取文件
+       while (fgets(line, sizeof(line), net_dev_file)) {
+              // 在 /proc/net/dev 文件中搜索指定网络接口的信息
+              if (strstr(line, interface) != NULL) {
+                     found = 1;
+                     // 解析收发字节数
+                     // 跳过 line 字符串开头的空格或制表符，从第一个非空格非制表符的字符开始解析
+                     sscanf(line + strspn(line, " \t"), "%*s %llu %*u %*u %*u %*u %*u %*u %*u %llu", rx_bytes, tx_bytes);
+                     break;
+              }
+       }
+       fclose(net_dev_file);
+       if (!found)
+       {
+              fprintf(stderr, "Interface '%s' not found in /proc/net/dev\n", interface);
+              return -1;
+       }
+       return 0;
+}
